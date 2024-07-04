@@ -1,25 +1,42 @@
+import json
+import os
 import logging
-from pydantic import BaseModel, Field, ValidationError, field_validator
-from keboola.component.exceptions import UserException
+from typing import Any, Dict
 
+class Configuration:
+    def __init__(self, config_path: str):
+        self.config_path = config_path
+        self.parameters = self._load_config()
 
-class Configuration(BaseModel):
-    print_hello: bool
-    api_token: str = Field(alias="#api_token")
-    debug: bool = False
+    def _load_config(self) -> Dict[str, Any]:
+        if not os.path.exists(self.config_path):
+            raise FileNotFoundError(f"Configuration file not found: {self.config_path}")
+        
+        with open(self.config_path, 'r') as config_file:
+            config = json.load(config_file)
+        
+        self._validate_config(config)
+        return config.get('parameters', {})
 
-    def __init__(self, **data):
-        try:
-            super().__init__(**data)
-        except ValidationError as e:
-            error_messages = [f"{err['loc'][0]}: {err['msg']}" for err in e.errors()]
-            raise UserException(f"Validation Error: {', '.join(error_messages)}")
+    def _validate_config(self, config: Dict[str, Any]) -> None:
+        if 'parameters' not in config:
+            raise ValueError("Configuration must contain 'parameters' key.")
 
-        if self.debug:
-            logging.debug("Component will run in Debug mode")
+        parameters = config['parameters']
 
-    @field_validator('api_token')
-    def token_must_be_uppercase(cls, v):
-        if not v.isupper():
-            raise UserException('API token must be uppercase')
-        return v
+        if 'use_openai' not in parameters:
+            raise ValueError("Configuration must contain 'use_openai' parameter.")
+        
+        if parameters['use_openai']:
+            if '#api_key' not in parameters:
+                raise ValueError("When 'use_openai' is true, '#api_key' must be provided.")
+            if 'openai_model' not in parameters:
+                raise ValueError("When 'use_openai' is true, 'openai_model' must be provided.")
+        
+        if not parameters['use_openai']:
+            if 'model_name' not in parameters:
+                raise ValueError("When 'use_openai' is false, 'model_name' must be provided.")
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self.parameters.get(key, default)
+

@@ -1,100 +1,88 @@
-"""
-Template Component main class.
-
-"""
-import csv
-from datetime import datetime
+import os
+import json
 import logging
-
+from typing import List, Any, Dict
+import pandas as pd
+from transformers import AutoModel, AutoTokenizer
+import torch
+import faiss
+import openai
 from keboola.component.base import ComponentBase
-from keboola.component.exceptions import UserException
-
+from keboola.component import CommonInterface, TableDefinition
 from configuration import Configuration
 
+# Initialize logging
+logging.basicConfig(level=logging.INFO)
 
-class Component(ComponentBase):
-    """
-        Extends base class for general Python components. Initializes the CommonInterface
-        and performs configuration validation.
-
-        For easier debugging the data folder is picked up by default from `../data` path,
-        relative to working directory.
-
-        If `debug` parameter is present in the `config.json`, the default logger is set to verbose DEBUG mode.
-    """
-
+class EmbeddingsComponent(ComponentBase):
     def __init__(self):
         super().__init__()
 
+        # Load configuration parameters
+        self.api_key = self.configuration.parameters.get('#api_key')
+        self.model_name = self.configuration.parameters.get('model_name', 'distilbert-base-uncased')
+        self.use_openai = self.configuration.parameters.get('use_openai', False)
+        self.openai_model = self.configuration.parameters.get('openai_model', 'text-embedding-ada-002')
+
+        # Initialize OpenAI if required
+        if self.use_openai:
+            openai.api_key = self.api_key
+
+        # Initialize local transformer model and tokenizer
+        if not self.use_openai:
+            self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+            self.model = AutoModel.from_pretrained(self.model_name)
+
     def run(self):
-        """
-        Main execution code
-        """
-
-        # ####### EXAMPLE TO REMOVE
-        # check for missing configuration parameters
-        params = Configuration(**self.configuration.parameters)
-
-        # Access parameters in configuration
-        if params.print_hello:
-            logging.info("Hello World")
-
-        # get input table definitions
+        # Get input tables and files
         input_tables = self.get_input_tables_definitions()
+        input_files = self.get_input_files_definitions()
+
+        # Generate embeddings for tabular data
         for table in input_tables:
-            logging.info(f'Received input table: {table.name} with path: {table.full_path}')
+            df = pd.read_csv(table.full_path)
+            embeddings = self.generate_embeddings(df['text_column'].tolist())  # Assuming the text column is named 'text_column'
+            self.create_faiss_index(embeddings, f"{table.destination}.index")
 
-        if len(input_tables) == 0:
-            raise UserException("No input tables found")
+        # Generate embeddings for files
+        for file in input_files:
+            with open(file.full_path, 'r') as f:
+                content = f.read()
+            embeddings = self.generate_embeddings([content])
+            self.create_faiss_index(embeddings, f"{file.file_name}.index")
 
-        # get last state data/in/state.json from previous run
-        previous_state = self.get_state_file()
-        logging.info(previous_state.get('some_parameter'))
+    def generate_embeddings(self, texts: List[str]) -> List[List[float]]:
+        if self.use_openai:
+            return self.generate_openai_embeddings(texts)
+        else:
+            return self.generate_local_embeddings(texts)
 
-        # Create output table (Table definition - just metadata)
-        table = self.create_out_table_definition('output.csv', incremental=True, primary_key=['timestamp'])
+    def generate_openai_embeddings(self, texts: List[str]) -> List[List[float]]:
+        response = openai.Embedding.create(model=self.openai_model, input=texts)
+        return [embedding['embedding'] for embedding in response['data']]
 
-        # get file path of the table (data/out/tables/Features.csv)
-        out_table_path = table.full_path
-        logging.info(out_table_path)
+    def generate_local_embeddings(self, texts: List[str]) -> List[List[float]]:
+        inputs = self.tokenizer(texts, padding=True, truncation=True, return_tensors='pt')
+        with torch.no_grad():
+            outputs = self.model(**inputs)
+        return outputs.last_hidden_state[:, 0, :].tolist()
 
-        # Add timestamp column and save into out_table_path
-        input_table = input_tables[0]
-        with (open(input_table.full_path, 'r') as inp_file,
-              open(table.full_path, mode='wt', encoding='utf-8', newline='') as out_file):
-            reader = csv.DictReader(inp_file)
+    def create_faiss_index(self, embeddings: List[List[float]], index_file_name: str):
+        dimension = len(embeddings[0])
+        index = faiss.IndexFlatL2(dimension)
+        index.add(np.array(embeddings).astype('float32'))
+        faiss.write_index(index, os.path.join(self.data_path, index_file_name))
 
-            columns = list(reader.fieldnames)
-            # append timestamp
-            columns.append('timestamp')
+        # Save metadata for the index
+        index_metadata = {
+            "file_name": index_file_name,
+            "dimension": dimension,
+            "number_of_vectors": len(embeddings)
+        }
+        with open(os.path.join(self.data_path, f"{index_file_name}.json"), 'w') as f:
+            json.dump(index_metadata, f)
 
-            # write result with column added
-            writer = csv.DictWriter(out_file, fieldnames=columns)
-            writer.writeheader()
-            for in_row in reader:
-                in_row['timestamp'] = datetime.now().isoformat()
-                writer.writerow(in_row)
-
-        # Save table manifest (output.csv.manifest) from the Table definition
-        self.write_manifest(table)
-
-        # Write new state - will be available next run
-        self.write_state_file({"some_state_parameter": "value"})
-
-        # ####### EXAMPLE TO REMOVE END
-
-
-"""
-        Main entrypoint
-"""
-if __name__ == "__main__":
-    try:
-        comp = Component()
-        # this triggers the run method by default and is controlled by the configuration.action parameter
-        comp.execute_action()
-    except UserException as exc:
-        logging.exception(exc)
-        exit(1)
-    except Exception as exc:
-        logging.exception(exc)
-        exit(2)
+if __name__ == '__main__':
+    config = Configuration('/data/config.json')
+    component = EmbeddingsComponent()
+    component.run()
